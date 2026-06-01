@@ -1,0 +1,528 @@
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Set backend BEFORE pyplot import
+import matplotlib.pyplot as plt
+import glob
+import cv2
+import os
+import seaborn as sns
+import time
+import skimage
+
+from sklearn import preprocessing, metrics
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.model_selection import cross_val_predict, cross_validate, train_test_split
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier 
+from sklearn.preprocessing import StandardScaler, Normalizer
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neural_network import MLPClassifier
+
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras import Input 
+
+from keras.models import Model, Sequential
+from keras.layers import Dense, Flatten, Conv2D, MaxPooling2D
+from keras.applications import xception
+
+from skimage import exposure
+from skimage.feature import hog
+
+
+###########################
+#    PARAMETER SECTION    #
+###########################
+
+size = 32
+masking = False #fait
+feature_reduction = False # fait
+cross_val = 0
+model_type = 1
+test_proportion = 0.2 #fait
+stratisfy_status = True
+
+# Model types available
+
+# 0: random forest
+# 1: decision tree
+# 2: ada boosting
+# 3: gradient boosting
+# 4: MLP (multilayer perceptron neural network)
+
+###########################
+#      MASK FUNCTION      #
+###########################
+
+def create_mask_for_plant(image):
+    image_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    lower_hsv = np.array([0,0,250])
+    upper_hsv = np.array([250,255,255])
+    
+    mask = cv2.inRange(image_hsv, lower_hsv, upper_hsv)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11,11))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    
+    return mask
+
+#image segmentation function
+def segment_image(image):
+    mask = create_mask_for_plant(image)
+    output = cv2.bitwise_and(image, image, mask = mask)
+    return output / 255
+
+#sharpen the image
+def sharpen_image(image):
+    image_blurred = cv2.GaussianBlur(image, (0, 0), 3)
+    image_sharp = cv2.addWeighted(image, 1.5, image_blurred, -0.5, 0)
+    return image_sharp
+
+###########################
+#        LOAD DATA        #
+###########################
+
+#TRAINING - Storing the training images and labelling them into numpy arrays
+train_images = []
+train_labels = []
+
+for directory_path in glob.glob("Full_Data/*"):
+    training_label = directory_path.split("\\")[-1]
+    for img_path in glob.glob(os.path.join(directory_path, "*.jpg")):
+        img = cv2.imread(img_path, (cv2.IMREAD_COLOR))       
+        if img is not None:
+            img = cv2.resize(img, (size, size))
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            if masking:
+                #masking + segmentation
+                img = segment_image(img)
+                #sharpening
+                img = sharpen_image(img)
+                #img = xception.preprocess_input(np.expand_dims(img.copy(), axis=0))
+            train_images.append(img)
+            train_labels.append(training_label)
+                    
+train_images = np.array(train_images)
+train_labels = np.array(train_labels)
+
+if stratisfy_status:
+    strat = train_labels
+else:
+    strat = None
+
+#Although we already split it above, we're re-assigning variables to use the convential variable names
+x_train, x_test, y_train, y_test = train_test_split(train_images, train_labels, test_size = test_proportion, stratify=strat, random_state=42)
+#In this case, x variables store the numpy image arrays and the y variables store their labels
+
+#Visualisation of the number of photos per type
+def plot_bar(y, loc='left', relative=True):
+    width = 0.35
+    if loc == 'left':
+        n = -0.5
+    elif loc == 'right':
+        n = 0.5
+    
+    # calculate counts per type and sort, to ensure their order
+    unique, counts = np.unique(y, return_counts=True)
+    sorted_index = np.argsort(unique)
+    unique = unique[sorted_index]
+    if relative:
+        # plot as a percentage
+        counts = 100*counts[sorted_index]/len(y)
+        ylabel_text = '% count'
+    else:
+        # plot counts
+        counts = counts[sorted_index]
+        ylabel_text = 'count'
+         
+    xtemp = np.arange(len(unique))
+     
+    plt.bar(xtemp + n*width, counts, align='center', alpha=.7, width=width)
+    plt.xticks(xtemp, unique, rotation=45)
+    plt.xlabel('equipment type')
+    plt.ylabel(ylabel_text)
+ 
+plt.suptitle('relative amount of photos per type')
+plot_bar(y_train, loc='left')
+plot_bar(y_test, loc='right')
+plt.legend([
+    'train ({0} photos)'.format(len(y_train)), 
+    'test ({0} photos)'.format(len(y_test))
+]);
+
+#Encode labels from text to integers so that the machine understands
+le = preprocessing.LabelEncoder()
+le.fit(y_test)
+y_test_raw = y_test
+y_test = le.transform(y_test)
+le.fit(y_train)
+y_train = le.transform(y_train)
+#What this does is change the "Fire" label to 0 and the "Non_Fire" label to 1
+
+# Normalize pixel values to between 0 and 1
+x_train, x_test = x_train / 255.0, x_test / 255.0
+
+#One hot encode y values for neural network - we're using a table system to differentiate between the labels
+#This is the conventional way of handling labels in neural networks
+
+y_train_one_hot = to_categorical(y_train)
+y_test_one_hot = to_categorical(y_test)
+
+
+###########################
+#  VISUALIZATION SETUP    #
+###########################
+
+# Create plots directory
+plots_dir = './plots'
+os.makedirs(plots_dir, exist_ok=True)
+print(f"Plot output directory: {os.path.abspath(plots_dir)}")
+
+
+def plot_actual_vs_predicted(y_true, y_pred, class_names=None, title='Actual vs Predicted', filename='actual_vs_predicted.png'):
+    """Plot and save actual vs predicted comparison."""
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    if y_true.ndim > 1 and y_true.shape[1] > 1:
+        y_true = np.argmax(y_true, axis=1)
+    elif y_true.ndim > 1 and y_true.shape[1] == 1:
+        y_true = y_true.ravel()
+
+    if y_pred.ndim > 1 and y_pred.shape[1] > 1:
+        y_pred = np.argmax(y_pred, axis=1)
+    elif y_pred.ndim > 1 and y_pred.shape[1] == 1:
+        y_pred = (y_pred.ravel() >= 0.5).astype(int)
+
+    x_axis = np.arange(len(y_true))
+
+    fig, ax = plt.subplots(figsize=(14, 6), dpi=120)
+
+    ax.plot(x_axis, y_true, linestyle='--', linewidth=2.5, color='#1f77b4', label='Actual', alpha=0.8)
+    ax.plot(x_axis, y_pred, linestyle='-', linewidth=2.5, color='#ff7f0e', label='Predicted', alpha=0.8)
+    ax.scatter(x_axis, y_true, s=35, color='#1f77b4', alpha=0.6, edgecolors='black', linewidth=0.5)
+    ax.scatter(x_axis, y_pred, s=35, color='#ff7f0e', alpha=0.6, edgecolors='black', linewidth=0.5)
+
+    ax.set_title(title, fontsize=16, fontweight='bold', pad=15)
+    ax.set_xlabel('Sample Index', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Class Label', fontsize=12, fontweight='bold')
+    ax.grid(True, linestyle='--', alpha=0.4, linewidth=0.7)
+    ax.legend(frameon=True, shadow=True, loc='best', fontsize=11)
+    ax.set_axisbelow(True)
+
+    if class_names is not None:
+        ticks = sorted(set(np.concatenate([y_true, y_pred]).astype(int)))
+        if len(class_names) > max(ticks, default=-1):
+            ax.set_yticks(ticks)
+            ax.set_yticklabels([class_names[i] for i in ticks], fontsize=10)
+
+    plt.tight_layout()
+    filepath = os.path.join(plots_dir, filename)
+    plt.savefig(filepath, dpi=120, bbox_inches='tight')
+    print(f"✓ Saved: {filepath}")
+    plt.close(fig)
+
+
+def save_confusion_matrix(y_true, y_pred, class_names=None, title='Confusion Matrix', filename='confusion_matrix.png'):
+    """Plot and save confusion matrix."""
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=120)
+    
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                cbar_kws={'label': 'Count'},
+                linewidths=1.5, linecolor='black',
+                xticklabels=class_names if class_names else 'auto',
+                yticklabels=class_names if class_names else 'auto',
+                ax=ax, square=True, annot_kws={'size': 14, 'weight': 'bold'})
+    
+    ax.set_title(title, fontsize=16, fontweight='bold', pad=15)
+    ax.set_ylabel('True Label', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Predicted Label', fontsize=12, fontweight='bold')
+    
+    plt.tight_layout()
+    filepath = os.path.join(plots_dir, filename)
+    plt.savefig(filepath, dpi=120, bbox_inches='tight')
+    print(f"✓ Saved: {filepath}")
+    plt.close(fig)
+
+
+def save_training_history(history, filename='training_history.png'):
+    """Plot and save training history."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), dpi=120)
+    
+    epochs_range = range(1, len(history.history['loss']) + 1)
+    
+    # Loss plot
+    ax1.plot(epochs_range, history.history['loss'], 'o-', linewidth=2.5, 
+            markersize=6, label='Training Loss', color='#d62728')
+    ax1.plot(epochs_range, history.history['val_loss'], 's-', linewidth=2.5, 
+            markersize=6, label='Validation Loss', color='#2ca02c')
+    ax1.set_title('Model Loss', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('Epoch', fontsize=11)
+    ax1.set_ylabel('Loss', fontsize=11)
+    ax1.grid(True, alpha=0.4)
+    ax1.legend(fontsize=10)
+    
+    # Accuracy plot
+    ax2.plot(epochs_range, history.history['accuracy'], 'o-', linewidth=2.5, 
+            markersize=6, label='Training Accuracy', color='#1f77b4')
+    ax2.plot(epochs_range, history.history['val_accuracy'], 's-', linewidth=2.5, 
+            markersize=6, label='Validation Accuracy', color='#ff7f0e')
+    ax2.set_title('Model Accuracy', fontsize=14, fontweight='bold')
+    ax2.set_xlabel('Epoch', fontsize=11)
+    ax2.set_ylabel('Accuracy', fontsize=11)
+    ax2.grid(True, alpha=0.4)
+    ax2.legend(fontsize=10)
+    
+    plt.tight_layout()
+    filepath = os.path.join(plots_dir, filename)
+    plt.savefig(filepath, dpi=120, bbox_inches='tight')
+    print(f"✓ Saved: {filepath}")
+    plt.close(fig)
+
+
+###########################
+#    FEATURE REDUCTION    #
+###########################
+
+#Alternative to feature selection - feature reduction  
+class RGB2GrayTransformer(BaseEstimator, TransformerMixin):
+    """
+    Convert an array of RGB images to grayscale
+    """
+ 
+    def __init__(self):
+        pass
+ 
+    def fit(self, X, y=None):
+        """returns itself"""
+        return self
+ 
+    def transform(self, X, y=None):
+        """perform the transformation and return an array"""
+        return np.array([skimage.color.rgb2gray(img) for img in X])
+     
+ 
+class HogTransformer(BaseEstimator, TransformerMixin):
+    """
+    Expects an array of 2d arrays (1 channel images)
+    Calculates hog features for each img
+    """
+ 
+    def __init__(self, y=None, orientations=9,
+                 pixels_per_cell=(8, 8),
+                 cells_per_block=(3, 3), block_norm='L2-Hys'):
+        self.y = y
+        self.orientations = orientations
+        self.pixels_per_cell = pixels_per_cell
+        self.cells_per_block = cells_per_block
+        self.block_norm = block_norm
+ 
+    def fit(self, X, y=None):
+        return self
+ 
+    def transform(self, X, y=None):
+ 
+        def local_hog(X):
+            return hog(X,
+                       orientations=self.orientations,
+                       pixels_per_cell=self.pixels_per_cell,
+                       cells_per_block=self.cells_per_block,
+                       block_norm=self.block_norm)
+ 
+        try: # parallel
+            return np.array([local_hog(img) for img in X])
+        except:
+            return np.array([local_hog(img) for img in X])
+
+if feature_reduction:    
+    # create an instance of each transformer
+    grayify = RGB2GrayTransformer()
+    hogify = HogTransformer(
+        pixels_per_cell=(14, 14), 
+        cells_per_block=(2,2), 
+        orientations=9, 
+        block_norm='L2-Hys'
+    )
+    scalify = StandardScaler()
+    
+    # call fit_transform on each transform converting X_train step by step
+    x_train = scalify.fit_transform(hogify.fit_transform(grayify.fit_transform(x_train)))
+    
+###########################
+#           CNN           #
+###########################
+
+start_ts=time.time()
+
+activation = 'sigmoid'
+
+inputs = Input(shape=(size, size, 3))
+x = Conv2D(32, 3, activation=activation, padding='same')(inputs)
+x = BatchNormalization()(x)
+x = Conv2D(32, 3, activation=activation, padding='same', kernel_initializer='he_uniform')(x)
+x = BatchNormalization()(x)
+x = MaxPooling2D()(x)
+x = Conv2D(64, 3, activation=activation, padding='same', kernel_initializer='he_uniform')(x)
+x = BatchNormalization()(x)
+x = Conv2D(64, 3, activation=activation, padding='same', kernel_initializer='he_uniform')(x)
+x = BatchNormalization()(x)
+x = MaxPooling2D()(x)
+x = Flatten()(x)
+
+# Feature extractor used later by the tree/boosting models.
+model = Model(inputs=inputs, outputs=x)
+
+x = Dense(128, activation=activation, kernel_initializer='he_uniform')(model.output)
+prediction_layer = Dense(2, activation='softmax')(x)
+
+cnn_model = Model(inputs=inputs, outputs=prediction_layer)
+cnn_model.compile(optimizer='rmsprop',loss = 'categorical_crossentropy', metrics = ['accuracy'])
+print(cnn_model.summary()) 
+#What comes in are the images, what comes out are the labels (either 0 - fire or 1 - non_fire)
+
+#Train the CNN model
+history = cnn_model.fit(x_train, y_train_one_hot, epochs=7, validation_data = (x_test, y_test_one_hot))    
+
+print("CV Runtime:", time.time()-start_ts)
+
+# Save training history plots
+save_training_history(history, filename='cnn_training_history.png')
+
+
+prediction_NN_probs = cnn_model.predict(x_test) #Shows us the "probabilities" our model suggested for each image in x_test
+prediction_NN = np.argmax(prediction_NN_probs, axis=-1) #Converting the values to the final category chosen (1 and 0 format)
+prediction_NN = le.inverse_transform(prediction_NN) #Converting the computer format to our categorical format (0/1 to fire/non_fire)
+
+# Plot actual vs predicted for CNN
+plot_actual_vs_predicted(
+    y_test,
+    prediction_NN_probs,
+    class_names=le.classes_,
+    title='CNN: Actual vs Predicted Fire Labels',
+    filename='cnn_actual_vs_predicted.png'
+)
+
+# Save CNN confusion matrix
+save_confusion_matrix(y_test_raw, prediction_NN, 
+                     class_names=['FIRE', 'NON_FIRE'],
+                     title='CNN Confusion Matrix',
+                     filename='cnn_confusion_matrix.png')
+print(f"Confusion Matrix:\n{confusion_matrix(y_test_raw, prediction_NN)}")
+
+# Check results for specific image - Neural Network
+n = 299  # Index of image to be loaded for testing
+img = x_test[n]
+input_img = np.expand_dims(img, axis=0)
+prediction = np.argmax(cnn_model.predict(input_img))
+prediction = le.inverse_transform([prediction])
+print(f"\nSample Image #{n} - CNN Prediction:")
+print(f"  Predicted: {prediction[0]}")
+print(f"  Actual: {y_test_raw[n]}")
+
+# Save sample image
+fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
+ax.imshow(img)
+ax.set_title(f'Sample #{n} - Predicted: {prediction[0]}, Actual: {y_test_raw[n]}', 
+            fontsize=12, fontweight='bold')
+ax.axis('off')
+plt.tight_layout()
+filepath = os.path.join(plots_dir, 'cnn_sample_image.png')
+plt.savefig(filepath, dpi=100, bbox_inches='tight')
+print(f"✓ Saved: {filepath}")
+plt.close(fig)
+
+#for i in range(20,100):
+#    input_img = np.expand_dims(img, axis=0)
+#    prediction = np.argmax(cnn_model.predict(input_img))
+#    prediction = le.inverse_transform([prediction])
+#    
+#    if(prediction != y_test_raw[i]):    
+#        print("The prediction for this image is: ", prediction)
+#        print("The actual label for this image is: ", y_test_raw[i])
+#        plt.imshow(x_test[i])
+#        break
+
+
+################################
+#       DT / RF / BOOSTING     #
+################################
+
+#Now, let us use features from convolutional network for decision trees / random forests/ boosting methods
+x_for_model = model.predict(x_train)
+#X_for_model = model.predict(x_train_prepared)
+
+start_ts=time.time()
+
+if model_type == 0:
+    continuing_model = RandomForestClassifier(n_estimators = 100, criterion = 'entropy', max_depth = None, min_samples_split = 3, random_state = 42) 
+elif model_type == 1:
+    continuing_model = DecisionTreeClassifier(criterion='gini', splitter='best', max_depth=None, min_samples_split=5, min_samples_leaf=1, max_features=None, random_state = 42)
+elif model_type == 2:    
+    continuing_model = GradientBoostingClassifier(n_estimators = 100, loss = 'deviance', learning_rate = 0.1, max_depth =3, min_samples_split = 3, random_state = 42)
+elif model_type == 3:
+    continuing_model = AdaBoostClassifier(n_estimators = 100, base_estimator = None, learning_rate = 0.1, random_state = 42)
+else:
+    continuing_model = MLPClassifier(activation = 'logistic', solver = 'adam', alpha = 0.0001, max_iter = 1000, hidden_layer_sizes = (10,), random_state = 42)
+
+if cross_val == 0:
+    # Train the model on training data
+    continuing_model.fit(x_for_model , y_train)
+
+    X_test_feature = model.predict(x_test) #Feature extraction
+    prediction = continuing_model.predict(X_test_feature) #Prediction using the trained model 
+    prediction = le.inverse_transform(prediction) #Converting the computer format to our categorical format (0/1 to fire/non_fire)
+
+    print("Accuracy = ", metrics.accuracy_score(y_test_raw, prediction))
+    #print("Accuracy = ", classification_report(y_test, prediction))
+    #scores_ACC = continuing_model.score(x_test, y_test)
+    #print('Acc:', scores_ACC)
+    #scores_AUC = metrics.roc_auc_score(y_test, continuing_model.predict_proba(x_test)[:,1])
+    #print('AUC:', scores_AUC)   
+
+else: #cross_val == 1
+    #Setup Crossval classifier scorers
+    scorers = {'Accuracy': 'accuracy', 'roc_auc':'roc_auc'}
+    
+    #SciKit Decision Tree - Cross Val
+    scores = cross_validate(continuing_model, train_images, train_labels, scoring=scorers, cv=10)
+
+    scores_Acc = scores['test_Accuracy']
+    print("Acc: %0.2f (+/- %0.2f)" % (scores_Acc.mean(), scores_Acc.std() * 2))                                                                                                    
+    scores_AUC = scores['test_roc_auc']                                                                      #Only works with binary classes, not multiclass
+    print("AUC: %0.2f (+/- %0.2f)" % (scores_AUC.mean(), scores_AUC.std() * 2))                           
+    print("CV Runtime:", time.time()-start_ts)
+
+print("CV Runtime:", time.time()-start_ts)
+
+# Save confusion matrix for classifier
+save_confusion_matrix(y_test_raw, prediction,
+                     class_names=['FIRE', 'NON_FIRE'],
+                     title=f'{["Random Forest", "Decision Tree", "Gradient Boosting", "AdaBoost", "MLP"][model_type]} Confusion Matrix',
+                     filename=f'classifier_model_{model_type}_confusion_matrix.png')
+print(f"Confusion Matrix:\n{confusion_matrix(y_test_raw, prediction)}")
+
+# Check results for specific image - Classifier
+n = 42  # Index of image to be loaded for testing
+img = x_test[n]
+input_img = np.expand_dims(img, axis=0)
+input_img_features = model.predict(input_img)
+prediction = continuing_model.predict(input_img_features)[0]
+prediction = le.inverse_transform([prediction])
+print(f"\nSample Image #{n} - Classifier Prediction:")
+print(f"  Predicted: {prediction}")
+print(f"  Actual: {y_test_raw[n]}")
+
+# Save sample image
+fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
+ax.imshow(img)
+ax.set_title(f'Sample #{n} - Predicted: {prediction}, Actual: {y_test_raw[n]}',
+            fontsize=12, fontweight='bold')
+ax.axis('off')
+plt.tight_layout()
+filepath = os.path.join(plots_dir, 'classifier_sample_image.png')
+plt.savefig(filepath, dpi=100, bbox_inches='tight')
+print(f"✓ Saved: {filepath}")
+plt.close(fig)
+
+print(f"\n✓ All plots saved to: {os.path.abspath(plots_dir)}")

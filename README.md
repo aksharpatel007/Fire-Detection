@@ -1,4 +1,4 @@
-# Firewatch - AI-Powered Real-Time Fire Detection System
+# FireDetetion - Real-Time Fire Detection System
 
 **Advanced Fire Detection System Using Computer Vision and Deep Learning**
 

@@ -1,6 +1,4 @@
-# FireDetetion - Real-Time Fire Detection System
-
-**Advanced Fire Detection System Using Computer Vision and Deep Learning**
+# Advanced Fire Detection System Using Computer Vision and Deep Learning
 
 Complete open-source project with full source code. Combines CNN models, machine learning, and HSV color analysis for real-time flame identification in video streams and images.
 
